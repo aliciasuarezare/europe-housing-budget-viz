@@ -1,269 +1,164 @@
-import requests
-import pandas as pd
-from bs4 import BeautifulSoup
-import time
-import csv
 import os
-from datetime import datetime
-import json
-from urllib.parse import urljoin
+import re
+import time
+from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse
 
-class Homestra Scraper:
-    def __init__(self):
-        self.base_url = "https://homestra.com"
-        self.properties = []
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+
+from config import CITIES, COUNTRY_CAPITALS
+
+BASE_URL = "https://homestra.com"
+SEARCH_URL = f"{BASE_URL}/list/houses-for-sale/"
+PROPERTY_TYPES = {"house", "apartment", "flat", "townhouse", "maison", "villa"}
+
+
+class HomestraScraper:
+    """Conservative scraper for publicly accessible Homestra listing pages.
+
+    It uses the public search/detail pages only, identifies JSON-LD and visible
+    listing data, waits between requests, and never invents missing values.
+    """
+
+    def __init__(self, delay=1.5, max_pages=20):
+        self.delay = delay
+        self.max_pages = max_pages
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            "User-Agent": "Mozilla/5.0 (compatible; university-data-project/1.0; +https://github.com/aliciasuarezare/europe-housing-budget-viz)",
+            "Accept": "text/html,application/xhtml+xml",
         })
-        
-        # European cities to search
-        self.cities = {
-            'Amsterdam': 'nl',
-            'Rotterdam': 'nl',
-            'Madrid': 'es',
-            'Barcelona': 'es',
-            'Valencia': 'es',
-            'Lisbon': 'pt',
-            'Porto': 'pt',
-            'Paris': 'fr',
-            'Lyon': 'fr',
-            'Rome': 'it',
-            'Milan': 'it',
-            'Florence': 'it',
-            'Berlin': 'de',
-            'Munich': 'de',
-            'Brussels': 'be',
-            'Vienna': 'at',
-            'Athens': 'gr',
-            'Thessaloniki': 'gr',
-            'Dublin': 'ie',
-            'London': 'uk',
-            'Copenhagen': 'dk',
-            'Stockholm': 'se',
-            'Oslo': 'no',
-            'Helsinki': 'fi',
-            'Riga': 'lv',
-            'Zagreb': 'hr',
-            'Sofia': 'bg',
-            'Nicosia': 'cy'
-        }
-        
-        self.country_capitals = {
-            'nl': 'Amsterdam',
-            'es': 'Madrid',
-            'pt': 'Lisbon',
-            'fr': 'Paris',
-            'it': 'Rome',
-            'de': 'Berlin',
-            'be': 'Brussels',
-            'at': 'Vienna',
-            'gr': 'Athens',
-            'ie': 'Dublin',
-            'uk': 'London',
-            'dk': 'Copenhagen',
-            'se': 'Stockholm',
-            'no': 'Oslo',
-            'fi': 'Helsinki',
-            'lv': 'Riga',
-            'hr': 'Zagreb',
-            'bg': 'Sofia',
-            'cy': 'Nicosia'
-        }
+        self.properties = []
 
-    def search_homestra(self, city, country_code, min_price=200000, max_price=400000):
-        """Search Homestra for properties in a city within price range"""
-        print(f"Searching {city}, {country_code}...")
-        
+    def _get(self, url, params=None):
+        response = self.session.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        time.sleep(self.delay)
+        return response
+
+    @staticmethod
+    def _number(value):
+        if value is None:
+            return None
+        text = str(value).replace("\xa0", " ").strip()
+        numbers = re.findall(r"\d+(?:[.,]\d+)?", text.replace(".", "").replace(",", "."))
+        if not numbers:
+            return None
         try:
-            # Construct search URL for Homestra
-            search_url = f"{self.base_url}/en/search"
-            params = {
-                'city': city,
-                'country': country_code,
-                'price_min': min_price,
-                'price_max': max_price,
-                'property_type': ['apartment', 'house', 'townhouse']
-            }
-            
-            response = self.session.get(search_url, params=params, timeout=10)
-            response.raise_for_status()
-            
-            # Parse results
-            soup = BeautifulSoup(response.content, 'lxml')
-            self.parse_listings(soup, city, country_code)
-            
-            time.sleep(2)  # Respectful rate limiting
-            
-        except Exception as e:
-            print(f"Error searching {city}: {str(e)}")
+            return float(numbers[0])
+        except ValueError:
+            return None
 
-    def parse_listings(self, soup, city, country_code):
-        """Parse property listings from Homestra search results"""
-        listings = soup.find_all('div', class_='property-card')
-        
-        for listing in listings:
+    @staticmethod
+    def _price(value):
+        if value is None:
+            return None
+        text = str(value).replace("\xa0", " ")
+        digits = re.sub(r"[^0-9]", "", text)
+        return float(digits) if digits else None
+
+    @staticmethod
+    def _text(node):
+        return node.get_text(" ", strip=True) if node else None
+
+    def _json_ld(self, soup):
+        records = []
+        for script in soup.select('script[type="application/ld+json"]'):
             try:
-                property_data = self.extract_property_data(listing, city, country_code)
-                if property_data:
-                    self.properties.append(property_data)
-            except Exception as e:
-                print(f"Error parsing listing: {str(e)}")
+                import json
+                value = json.loads(script.string or script.get_text())
+                values = value if isinstance(value, list) else value.get("@graph", [value]) if isinstance(value, dict) else []
+                records.extend(v for v in values if isinstance(v, dict))
+            except (ValueError, TypeError):
                 continue
+        return records
 
-    def extract_property_data(self, listing_element, city, country_code):
-        """Extract data from a single property listing"""
-        try:
-            # Extract basic information
-            title = listing_element.find('h2', class_='property-title')
-            price_elem = listing_element.find('span', class_='property-price')
-            size_elem = listing_element.find('span', class_='property-size')
-            bedrooms_elem = listing_element.find('span', class_='property-beds')
-            
-            if not all([title, price_elem, size_elem]):
-                return None
-            
-            # Parse price
-            price_text = price_elem.text.strip()
-            price = self.parse_price(price_text)
-            
-            # Parse size
-            size_text = size_elem.text.strip()
-            size_m2 = self.parse_size(size_text)
-            
-            if price is None or size_m2 is None:
-                return None
-            
-            # Parse bedrooms
-            bedrooms = None
-            if bedrooms_elem:
-                bedrooms_text = bedrooms_elem.text.strip()
-                bedrooms = self.parse_bedrooms(bedrooms_text)
-            
-            # Get listing URL
-            link_elem = listing_element.find('a', class_='property-link')
-            listing_url = link_elem['href'] if link_elem else None
-            if listing_url and not listing_url.startswith('http'):
-                listing_url = urljoin(self.base_url, listing_url)
-            
-            # Extract bathrooms if available
-            bathrooms_elem = listing_element.find('span', class_='property-baths')
-            bathrooms = None
-            if bathrooms_elem:
-                bathrooms_text = bathrooms_elem.text.strip()
-                bathrooms = self.parse_bathrooms(bathrooms_text)
-            
-            # Determine property type
-            property_type = self.determine_property_type(listing_element)
-            
-            # Calculate price per m²
-            price_per_m2 = price / size_m2 if size_m2 > 0 else None
-            
-            return {
-                'country': country_code.upper(),
-                'city': city,
-                'neighbourhood': self.extract_neighbourhood(listing_element),
-                'price_eur': price,
-                'size_m2': size_m2,
-                'price_per_m2': price_per_m2,
-                'bedrooms': bedrooms,
-                'bathrooms': bathrooms,
-                'property_type': property_type,
-                'listing_url': listing_url,
-                'listing_date': self.extract_listing_date(listing_element),
-                'is_capital': city == self.country_capitals.get(country_code),
-                'scrape_date': datetime.now().isoformat()
-            }
-            
-        except Exception as e:
-            print(f"Error extracting property data: {str(e)}")
+    def _listing_urls(self, soup):
+        urls = set()
+        for link in soup.select('a[href*="/property/"]'):
+            href = urljoin(BASE_URL, link.get("href", "")).split("#")[0]
+            if urlparse(href).netloc.endswith("homestra.com"):
+                urls.add(href.rstrip("/") + "/")
+        return urls
+
+    def _extract_detail(self, url, fallback_city=None, fallback_country=None):
+        soup = BeautifulSoup(self._get(url).text, "lxml")
+        records = self._json_ld(soup)
+        data = next((x for x in records if x.get("@type") in {"Product", "Residence", "RealEstateListing", "Offer"}), {})
+        text = soup.get_text(" ", strip=True)
+        title = data.get("name") or self._text(soup.select_one("h1"))
+        offers = data.get("offers", {}) if isinstance(data.get("offers"), dict) else {}
+        price = self._price(offers.get("price") or data.get("price"))
+        if price is None:
+            price = self._price(re.search(r"€\s?[\d.,]+", text).group(0)) if re.search(r"€\s?[\d.,]+", text) else None
+        address = data.get("address")
+        if isinstance(address, dict):
+            address = ", ".join(str(address.get(k)) for k in ("addressLocality", "addressRegion", "addressCountry") if address.get(k))
+        address = address or self._text(soup.select_one('[itemprop="address"], .address, [class*="address"]'))
+        city = fallback_city or self._city_from_address(address)
+        country = fallback_country or self._country_from_address(address)
+        size = self._number(data.get("floorSize") or data.get("size"))
+        if size is None:
+            match = re.search(r"(\d+(?:[.,]\d+)?)\s*m(?:²|2)", text, re.I)
+            size = self._number(match.group(1)) if match else None
+        geo = data.get("geo") if isinstance(data.get("geo"), dict) else {}
+        return {
+            "source_id": data.get("productID") or data.get("sku"),
+            "country": country,
+            "city": city,
+            "neighbourhood": None,
+            "price_eur": price,
+            "size_m2": size,
+            "price_per_m2": price / size if price and size else None,
+            "bedrooms": self._number(data.get("numberOfBedrooms")),
+            "bathrooms": self._number(data.get("numberOfBathrooms")),
+            "property_type": data.get("additionalType") or data.get("@type"),
+            "listing_url": url,
+            "listing_date": data.get("datePosted") or data.get("datePublished"),
+            "latitude": geo.get("latitude"),
+            "longitude": geo.get("longitude"),
+            "is_capital": city == COUNTRY_CAPITALS.get((country or "").lower()),
+            "scrape_date": datetime.now(timezone.utc).isoformat(),
+            "title": title,
+        }
+
+    @staticmethod
+    def _city_from_address(address):
+        if not address:
             return None
+        lowered = address.lower()
+        return next((city for city in CITIES if city.lower() in lowered), None)
 
     @staticmethod
-    def parse_price(price_text):
-        """Extract numeric price from text"""
-        try:
-            price_text = price_text.replace('€', '').replace(',', '').strip()
-            return float(price_text)
-        except:
+    def _country_from_address(address):
+        if not address:
             return None
+        lowered = address.lower()
+        country_names = {"netherlands":"NL", "spain":"ES", "portugal":"PT", "france":"FR", "italy":"IT", "germany":"DE", "belgium":"BE", "austria":"AT", "greece":"GR", "ireland":"IE", "united kingdom":"UK", "denmark":"DK", "sweden":"SE", "norway":"NO", "finland":"FI", "latvia":"LV", "croatia":"HR", "bulgaria":"BG", "cyprus":"CY"}
+        return next((code for name, code in country_names.items() if name in lowered), None)
 
-    @staticmethod
-    def parse_size(size_text):
-        """Extract numeric size from text"""
-        try:
-            size_text = size_text.replace('m²', '').replace('m2', '').strip()
-            return float(size_text)
-        except:
-            return None
-
-    @staticmethod
-    def parse_bedrooms(bedrooms_text):
-        """Extract number of bedrooms"""
-        try:
-            return int(bedrooms_text.split()[0])
-        except:
-            return None
-
-    @staticmethod
-    def parse_bathrooms(bathrooms_text):
-        """Extract number of bathrooms"""
-        try:
-            return float(bathrooms_text.split()[0])
-        except:
-            return None
-
-    @staticmethod
-    def extract_neighbourhood(listing_element):
-        """Extract neighbourhood/area if available"""
-        area_elem = listing_element.find('span', class_='property-area')
-        return area_elem.text.strip() if area_elem else None
-
-    @staticmethod
-    def extract_listing_date(listing_element):
-        """Extract listing date if available"""
-        date_elem = listing_element.find('span', class_='listing-date')
-        return date_elem.text.strip() if date_elem else None
-
-    @staticmethod
-    def determine_property_type(listing_element):
-        """Determine property type from listing"""
-        type_elem = listing_element.find('span', class_='property-type')
-        if type_elem:
-            type_text = type_elem.text.strip().lower()
-            if 'apartment' in type_text or 'flat' in type_text:
-                return 'Apartment'
-            elif 'house' in type_text:
-                return 'House'
-            elif 'townhouse' in type_text or 'town house' in type_text:
-                return 'Townhouse'
-        return 'Residential'
-
-    def scrape_all_cities(self):
-        """Scrape all cities"""
-        for city, country_code in self.cities.items():
-            self.search_homestra(city, country_code)
-        
-        return self.properties
-
-    def save_to_csv(self, filename='data/homestra_properties_raw.csv'):
-        """Save collected properties to CSV"""
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
-        
-        if not self.properties:
-            print("No properties to save")
-            return
-        
-        df = pd.DataFrame(self.properties)
-        df.to_csv(filename, index=False)
-        print(f"Saved {len(self.properties)} properties to {filename}")
-        
+    def scrape(self, output="data/homestra_properties_raw.csv"):
+        for page in range(1, self.max_pages + 1):
+            response = self._get(SEARCH_URL, params={"minimum-price": 200000, "maximum-price": 400000, "page": page})
+            soup = BeautifulSoup(response.text, "lxml")
+            urls = self._listing_urls(soup)
+            if not urls:
+                break
+            for url in sorted(urls):
+                try:
+                    item = self._extract_detail(url)
+                    if item["price_eur"] and item["size_m2"] and 200000 <= item["price_eur"] <= 400000:
+                        self.properties.append(item)
+                except requests.RequestException as exc:
+                    print(f"Skipping inaccessible listing {url}: {exc}")
+        df = pd.DataFrame(self.properties).drop_duplicates(subset=["listing_url"])
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        df.to_csv(output, index=False)
+        print(f"Saved {len(df)} verified Homestra listings to {output}")
         return df
 
 
 if __name__ == "__main__":
-    scraper = Homestra Scraper()
-    properties = scraper.scrape_all_cities()
-    scraper.save_to_csv()
-    
-    print(f"\nTotal properties collected: {len(properties)}")
+    HomestraScraper(delay=float(os.getenv("HOMESTRA_DELAY", "1.5")), max_pages=int(os.getenv("HOMESTRA_MAX_PAGES", "20"))).scrape()
