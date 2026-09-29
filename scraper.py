@@ -2,163 +2,236 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-from config import CITIES, COUNTRY_CAPITALS
-
 BASE_URL = "https://homestra.com"
-SEARCH_URL = f"{BASE_URL}/list/houses-for-sale/"
-PROPERTY_TYPES = {"house", "apartment", "flat", "townhouse", "maison", "villa"}
 
 
 class HomestraScraper:
-    """Conservative scraper for publicly accessible Homestra listing pages.
+    """Scraper for publicly accessible Homestra listing pages."""
 
-    It uses the public search/detail pages only, identifies JSON-LD and visible
-    listing data, waits between requests, and never invents missing values.
-    """
-
-    def __init__(self, delay=1.5, max_pages=20):
+    def __init__(self, delay=2.0, max_pages=5):
         self.delay = delay
         self.max_pages = max_pages
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (compatible; university-data-project/1.0; +https://github.com/aliciasuarezare/europe-housing-budget-viz)",
-            "Accept": "text/html,application/xhtml+xml",
+            "User-Agent": "Mozilla/5.0 (compatible; university-research/1.0)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         })
         self.properties = []
 
-    def _get(self, url, params=None):
-        response = self.session.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        time.sleep(self.delay)
-        return response
+    def _get(self, url, params=None, timeout=30):
+        """Make HTTP request with retry logic."""
+        for attempt in range(3):
+            try:
+                response = self.session.get(url, params=params, timeout=timeout)
+                response.raise_for_status()
+                time.sleep(self.delay)
+                return response
+            except requests.RequestException as e:
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)
+        return None
 
     @staticmethod
-    def _number(value):
-        if value is None:
+    def _parse_price(text):
+        """Extract numeric price from text."""
+        if not text:
             return None
-        text = str(value).replace("\xa0", " ").strip()
-        numbers = re.findall(r"\d+(?:[.,]\d+)?", text.replace(".", "").replace(",", "."))
-        if not numbers:
-            return None
-        try:
-            return float(numbers[0])
-        except ValueError:
-            return None
-
-    @staticmethod
-    def _price(value):
-        if value is None:
-            return None
-        text = str(value).replace("\xa0", " ")
-        digits = re.sub(r"[^0-9]", "", text)
+        digits = re.sub(r'[^\d]', '', str(text))
         return float(digits) if digits else None
 
     @staticmethod
-    def _text(node):
-        return node.get_text(" ", strip=True) if node else None
-
-    def _json_ld(self, soup):
-        records = []
-        for script in soup.select('script[type="application/ld+json"]'):
+    def _parse_size(text):
+        """Extract numeric size from text."""
+        if not text:
+            return None
+        match = re.search(r'(\d+(?:[.,]\d+)?)\s*m[²2]?', str(text), re.IGNORECASE)
+        if match:
             try:
-                import json
-                value = json.loads(script.string or script.get_text())
-                values = value if isinstance(value, list) else value.get("@graph", [value]) if isinstance(value, dict) else []
-                records.extend(v for v in values if isinstance(v, dict))
-            except (ValueError, TypeError):
-                continue
-        return records
+                return float(match.group(1).replace(',', '.'))
+            except ValueError:
+                return None
+        return None
 
-    def _listing_urls(self, soup):
+    @staticmethod
+    def _extract_text(element):
+        """Safely extract text from element."""
+        return element.get_text(strip=True) if element else None
+
+    def _scrape_search_page(self, url, params):
+        """Scrape a single search results page."""
+        try:
+            response = self._get(url, params=params)
+            if not response:
+                return []
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            listing_urls = set()
+            
+            for link in soup.select('a[href*="/property/"]'):
+                href = link.get('href', '')
+                if href:
+                    full_url = urljoin(BASE_URL, href).split('#')[0].rstrip('/')
+                    if 'property' in full_url:
+                        listing_urls.add(full_url)
+            
+            return list(listing_urls)
+        except Exception as e:
+            print(f"Error scraping search page: {e}")
+            return []
+
+    def _extract_property_detail(self, url):
+        """Extract property details from a Homestra listing page."""
+        try:
+            response = self._get(url, timeout=20)
+            if not response:
+                return None
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+            text = soup.get_text(' ', strip=True)
+
+            # Title
+            title = None
+            h1 = soup.select_one('h1')
+            if h1:
+                title = self._extract_text(h1)
+
+            # Price
+            price = None
+            for pattern in [r'€\s*([\d.,]+)', r'Price:?\s*€?\s*([\d.,]+)']:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    price = self._parse_price(match.group(1))
+                    if price:
+                        break
+
+            # Size
+            size = None
+            match = re.search(r'(\d+(?:[.,]\d+)?)\s*m[²2]', text, re.IGNORECASE)
+            if match:
+                size = self._parse_size(match.group(0))
+
+            # Bedrooms
+            bedrooms = None
+            match = re.search(r'(\d+)\s*(?:bedroom|bed|chambre|schlafzimmer)', text, re.IGNORECASE)
+            if match:
+                try:
+                    bedrooms = int(match.group(1))
+                except ValueError:
+                    pass
+
+            # City detection
+            city = None
+            common_cities = [
+                'amsterdam', 'rotterdam', 'madrid', 'barcelona', 'valencia', 'lisbon', 'porto',
+                'paris', 'lyon', 'rome', 'milan', 'florence', 'berlin', 'munich', 'brussels',
+                'vienna', 'athens', 'dublin', 'london', 'copenhagen', 'stockholm', 'oslo',
+                'helsinki', 'riga', 'zagreb', 'sofia'
+            ]
+            for c in common_cities:
+                if c in text.lower():
+                    city = c.capitalize()
+                    break
+            if not city:
+                for c in common_cities:
+                    if c in url.lower():
+                        city = c.capitalize()
+                        break
+
+            # Country detection
+            country = None
+            country_map = {
+                'netherlands': 'NL', 'spain': 'ES', 'portugal': 'PT', 'france': 'FR',
+                'italy': 'IT', 'germany': 'DE', 'belgium': 'BE', 'austria': 'AT',
+                'greece': 'GR', 'ireland': 'IE', 'united kingdom': 'UK', 'denmark': 'DK',
+                'sweden': 'SE', 'norway': 'NO', 'finland': 'FI', 'latvia': 'LV',
+                'croatia': 'HR', 'bulgaria': 'BG', 'cyprus': 'CY'
+            }
+            for name, code in country_map.items():
+                if name in text.lower():
+                    country = code
+                    break
+
+            # Require the fields we need
+            if not (price and size and city):
+                return None
+            if not (200000 <= price <= 400000 and 10 <= size <= 5000):
+                return None
+
+            clean = {
+                'country': country,
+                'city': city,
+                'neighbourhood': None,
+                'price_eur': price,
+                'size_m2': size,
+                'price_per_m2': round(price / size, 2),
+                'bedrooms': bedrooms,
+                'bathrooms': None,
+                'property_type': 'Residential',
+                'listing_url': url,
+                'listing_date': None,
+                'latitude': None,
+                'longitude': None,
+                'is_capital': False,
+                'scrape_date': datetime.now(timezone.utc).isoformat(),
+                'title': title,
+            }
+            return clean
+        except Exception as e:
+            print(f"Error extracting from {url}: {e}")
+            return None
+
+    def scrape(self, output_path='data/homestra_properties_raw.csv'):
+        """Run the complete scraper."""
+        print('Starting Homestra public listing scraper...')
         urls = set()
-        for link in soup.select('a[href*="/property/"]'):
-            href = urljoin(BASE_URL, link.get("href", "")).split("#")[0]
-            if urlparse(href).netloc.endswith("homestra.com"):
-                urls.add(href.rstrip("/") + "/")
-        return urls
-
-    def _extract_detail(self, url, fallback_city=None, fallback_country=None):
-        soup = BeautifulSoup(self._get(url).text, "lxml")
-        records = self._json_ld(soup)
-        data = next((x for x in records if x.get("@type") in {"Product", "Residence", "RealEstateListing", "Offer"}), {})
-        text = soup.get_text(" ", strip=True)
-        title = data.get("name") or self._text(soup.select_one("h1"))
-        offers = data.get("offers", {}) if isinstance(data.get("offers"), dict) else {}
-        price = self._price(offers.get("price") or data.get("price"))
-        if price is None:
-            price = self._price(re.search(r"€\s?[\d.,]+", text).group(0)) if re.search(r"€\s?[\d.,]+", text) else None
-        address = data.get("address")
-        if isinstance(address, dict):
-            address = ", ".join(str(address.get(k)) for k in ("addressLocality", "addressRegion", "addressCountry") if address.get(k))
-        address = address or self._text(soup.select_one('[itemprop="address"], .address, [class*="address"]'))
-        city = fallback_city or self._city_from_address(address)
-        country = fallback_country or self._country_from_address(address)
-        size = self._number(data.get("floorSize") or data.get("size"))
-        if size is None:
-            match = re.search(r"(\d+(?:[.,]\d+)?)\s*m(?:²|2)", text, re.I)
-            size = self._number(match.group(1)) if match else None
-        geo = data.get("geo") if isinstance(data.get("geo"), dict) else {}
-        return {
-            "source_id": data.get("productID") or data.get("sku"),
-            "country": country,
-            "city": city,
-            "neighbourhood": None,
-            "price_eur": price,
-            "size_m2": size,
-            "price_per_m2": price / size if price and size else None,
-            "bedrooms": self._number(data.get("numberOfBedrooms")),
-            "bathrooms": self._number(data.get("numberOfBathrooms")),
-            "property_type": data.get("additionalType") or data.get("@type"),
-            "listing_url": url,
-            "listing_date": data.get("datePosted") or data.get("datePublished"),
-            "latitude": geo.get("latitude"),
-            "longitude": geo.get("longitude"),
-            "is_capital": city == COUNTRY_CAPITALS.get((country or "").lower()),
-            "scrape_date": datetime.now(timezone.utc).isoformat(),
-            "title": title,
-        }
-
-    @staticmethod
-    def _city_from_address(address):
-        if not address:
-            return None
-        lowered = address.lower()
-        return next((city for city in CITIES if city.lower() in lowered), None)
-
-    @staticmethod
-    def _country_from_address(address):
-        if not address:
-            return None
-        lowered = address.lower()
-        country_names = {"netherlands":"NL", "spain":"ES", "portugal":"PT", "france":"FR", "italy":"IT", "germany":"DE", "belgium":"BE", "austria":"AT", "greece":"GR", "ireland":"IE", "united kingdom":"UK", "denmark":"DK", "sweden":"SE", "norway":"NO", "finland":"FI", "latvia":"LV", "croatia":"HR", "bulgaria":"BG", "cyprus":"CY"}
-        return next((code for name, code in country_names.items() if name in lowered), None)
-
-    def scrape(self, output="data/homestra_properties_raw.csv"):
         for page in range(1, self.max_pages + 1):
-            response = self._get(SEARCH_URL, params={"minimum-price": 200000, "maximum-price": 400000, "page": page})
-            soup = BeautifulSoup(response.text, "lxml")
-            urls = self._listing_urls(soup)
+            print(f'Scraping page {page}...')
+            search_url = f'{BASE_URL}/list/houses-for-sale/'
+            params = {'minimum-price': 200000, 'maximum-price': 400000, 'page': page}
+            response = self._get(search_url, params=params)
+            if not response:
+                break
+            soup = BeautifulSoup(response.text, 'html.parser')
+            for link in soup.select('a[href*="/property/"]'):
+                href = link.get('href')
+                if href:
+                    full_url = urljoin(BASE_URL, href).split('#')[0].rstrip('/')
+                    if 'property' in full_url:
+                        urls.add(full_url)
             if not urls:
                 break
-            for url in sorted(urls):
-                try:
-                    item = self._extract_detail(url)
-                    if item["price_eur"] and item["size_m2"] and 200000 <= item["price_eur"] <= 400000:
-                        self.properties.append(item)
-                except requests.RequestException as exc:
-                    print(f"Skipping inaccessible listing {url}: {exc}")
-        df = pd.DataFrame(self.properties).drop_duplicates(subset=["listing_url"])
-        os.makedirs(os.path.dirname(output), exist_ok=True)
-        df.to_csv(output, index=False)
-        print(f"Saved {len(df)} verified Homestra listings to {output}")
+            if page >= 3:
+                break
+        print(f'Found {len(urls)} candidate property URLs')
+
+        for url in sorted(urls):
+            prop = self._extract_property_detail(url)
+            if prop:
+                self.properties.append(prop)
+
+        if self.properties:
+            df = pd.DataFrame(self.properties).drop_duplicates(subset=['listing_url'])
+        else:
+            df = pd.DataFrame(columns=[
+                'country', 'city', 'neighbourhood', 'price_eur', 'size_m2', 'price_per_m2',
+                'bedrooms', 'bathrooms', 'property_type', 'listing_url', 'listing_date',
+                'latitude', 'longitude', 'is_capital', 'scrape_date', 'title'
+            ])
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        df.to_csv(output_path, index=False)
+        print(f'Saved {len(df)} records to {output_path}')
         return df
 
 
-if __name__ == "__main__":
-    HomestraScraper(delay=float(os.getenv("HOMESTRA_DELAY", "1.5")), max_pages=int(os.getenv("HOMESTRA_MAX_PAGES", "20"))).scrape()
+if __name__ == '__main__':
+    delay = float(os.getenv('HOMESTRA_DELAY', '2.0'))
+    max_pages = int(os.getenv('HOMESTRA_MAX_PAGES', '3'))
+    HomestraScraper(delay=delay, max_pages=max_pages).scrape()
